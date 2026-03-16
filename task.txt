@@ -1,0 +1,641 @@
+---
+
+## Step 2 — Update `lib/issues.js`
+
+Add these two functions at the bottom before `module.exports`:
+
+```js
+// Check if user has a similar open issue already
+// Simple approach: check if any open issue title shares significant words
+async function findSimilarOpenIssue(discordId, title) {
+  const { data, error } = await supabase
+    .from('issues')
+    .select('short_id, title, status, thread_id')
+    .eq('user_discord_id', discordId)
+    .not('status', 'in', '("resolved","closed")')
+    .order('created_at', { ascending: false });
+
+  if (error || !data || data.length === 0) return null;
+
+  // Extract meaningful words from new title (ignore short/common words)
+  const stopWords = new Set(['a','an','the','is','it','in','on','at','to','for',
+                             'of','and','or','but','not','my','i','cant','wont',
+                             'dont','can','with','was','has','have','from','this']);
+
+  const newWords = title.toLowerCase()
+    .split(/\s+/)
+    .filter(w => w.length > 3 && !stopWords.has(w));
+
+  for (const issue of data) {
+    const existingWords = issue.title.toLowerCase().split(/\s+/);
+    const matches = newWords.filter(w => existingWords.some(ew => ew.includes(w)));
+    // If 2 or more meaningful words match, flag as similar
+    if (matches.length >= 2) return issue;
+  }
+
+  return null;
+}
+
+// Mark an issue as reminded
+async function markReminded(issueId) {
+  const { error } = await supabase
+    .from('issues')
+    .update({
+      last_reminded_at: new Date().toISOString(),
+      reminder_count:   supabase.rpc('increment_reminder_count', { p_issue_id: issueId }),
+      updated_at:       new Date().toISOString()
+    })
+    .eq('id', issueId);
+
+  if (error) console.error('markReminded error:', error.message);
+}
+
+// Get issues that have been open 48hrs+ with no update and reminder count < 3
+async function getStaleIssues() {
+  const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+
+  const { data, error } = await supabase
+    .from('issues')
+    .select('*')
+    .in('status', ['open', 'acknowledged'])
+    .lt('updated_at', cutoff)
+    .lt('reminder_count', 3);
+
+  if (error) {
+    console.error('getStaleIssues error:', error.message);
+    return [];
+  }
+  return data || [];
+}
+```
+
+Add them to `module.exports`:
+
+```js
+module.exports = {
+  upsertUser,
+  createIssue,
+  attachThread,
+  saveMessage,
+  getIssueByShortId,
+  getUserOpenIssues,
+  updateStatus,
+  isAtIssueLimit,
+  findSimilarOpenIssue,   // new
+  markReminded,           // new
+  getStaleIssues          // new
+};
+```
+
+---
+
+## Step 3 — Add The Reminder Count Function In Supabase
+
+```sql
+create or replace function increment_reminder_count(p_issue_id uuid)
+returns void as $$
+begin
+  update issues
+  set reminder_count = reminder_count + 1
+  where id = p_issue_id;
+end;
+$$ language plpgsql;
+```
+
+---
+
+## Step 4 — New File: `lib/notify.js`
+
+All user notification logic in one place — both DM and thread message. Every status change goes through here:
+
+```js
+async function notifyUser(client, issue, newStatus, note) {
+  const STATUS_LABELS = {
+    open:         '🔴 Open',
+    acknowledged: '🟡 Acknowledged — a team member has seen your issue',
+    in_progress:  '🔵 In progress — someone is actively working on this',
+    resolved:     '🟢 Resolved',
+    closed:       '⚪ Closed'
+  };
+
+  const label = STATUS_LABELS[newStatus] || newStatus;
+
+  const lines = [
+    `**Update on ${issue.short_id}**`,
+    ``,
+    `Status: ${label}`,
+  ];
+
+  if (note) lines.push(``, `Note from team: ${note}`);
+
+  if (newStatus === 'resolved' || newStatus === 'closed') {
+    lines.push(``, `If your issue persists or comes back, feel free to file a new report.`);
+  }
+
+  const content = lines.join('\n');
+
+  // 1. Post inside the issue thread
+  if (issue.thread_id) {
+    try {
+      const thread = await client.channels.fetch(issue.thread_id);
+      if (thread) await thread.send({ content });
+    } catch (err) {
+      console.error(`Failed to notify in thread ${issue.thread_id}:`, err.message);
+    }
+  }
+
+  // 2. DM the user directly
+  try {
+    const user = await client.users.fetch(issue.user_discord_id);
+    if (user) {
+      const dmLines = [
+        `**Update on your issue ${issue.short_id}** — "${issue.title}"`,
+        ``,
+        `Status: ${label}`,
+      ];
+      if (note) dmLines.push(``, `Note from team: ${note}`);
+      if (newStatus === 'resolved' || newStatus === 'closed') {
+        dmLines.push(``, `If your issue comes back, file a new report in the server.`);
+      }
+      await user.send({ content: dmLines.join('\n') });
+    }
+  } catch (err) {
+    // DMs can fail if user has them disabled — not a critical error
+    if (err.code === 50007) {
+      console.warn(`User ${issue.user_discord_id} has DMs disabled`);
+    } else {
+      console.error(`Failed to DM user ${issue.user_discord_id}:`, err.message);
+    }
+  }
+}
+
+module.exports = { notifyUser };
+```
+
+---
+
+## Step 5 — New File: `lib/reminders.js`
+
+This runs on a timer and pings roles for stale issues:
+
+```js
+const { getStaleIssues, markReminded } = require('./issues');
+const { pingRoleInThread } = require('./forward');
+
+async function runReminderJob(client) {
+  console.log('[reminders] Checking for stale issues...');
+
+  const staleIssues = await getStaleIssues();
+
+  if (staleIssues.length === 0) {
+    console.log('[reminders] No stale issues found');
+    return;
+  }
+
+  console.log(`[reminders] Found ${staleIssues.length} stale issue(s)`);
+
+  for (const issue of staleIssues) {
+    if (!issue.thread_id) continue;
+
+    let thread;
+    try {
+      thread = await client.channels.fetch(issue.thread_id);
+    } catch (err) {
+      console.error(`[reminders] Could not fetch thread ${issue.thread_id}:`, err.message);
+      continue;
+    }
+
+    // Post reminder in thread
+    try {
+      await thread.send({
+        content: [
+          `**Reminder — ${issue.short_id} has had no update in 48 hours.**`,
+          ``,
+          `This issue is still **${issue.status}** and the user is waiting.`,
+          `Use \`/acknowledge ${issue.short_id}\` or \`/resolve ${issue.short_id}\` to update it.`
+        ].join('\n')
+      });
+    } catch (err) {
+      console.error(`[reminders] Failed to post reminder in thread:`, err.message);
+      continue;
+    }
+
+    // Ping role inside the thread
+    await pingRoleInThread(client, thread, issue, 'new_issue');
+
+    // Mark as reminded so we don't repeat until another 48hrs passes
+    await markReminded(issue.id);
+
+    // Small delay between issues to avoid rate limits
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
+module.exports = { runReminderJob };
+```
+
+---
+
+## Step 6 — New Command: `commands/close.js`
+
+Team-only close. Different from resolve — this is for spam, duplicates, or invalid reports:
+
+```js
+const { SlashCommandBuilder, MessageFlags } = require('discord.js');
+const { getIssueByShortId, updateStatus } = require('../lib/issues');
+const { notifyUser } = require('../lib/notify');
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('close')
+    .setDescription('Close an issue without resolving (team only)')
+    .addStringOption(opt =>
+      opt.setName('issue_id')
+        .setDescription('Issue ID e.g. ISS-1001')
+        .setRequired(true)
+    )
+    .addStringOption(opt =>
+      opt.setName('reason')
+        .setDescription('Why this is being closed')
+        .setRequired(false)
+    ),
+
+  async execute(interaction) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const shortId = interaction.options.getString('issue_id').toUpperCase();
+    const reason  = interaction.options.getString('reason') || 'Closed by support team.';
+    const issue   = await getIssueByShortId(shortId);
+
+    if (!issue) {
+      return interaction.editReply({ content: `No issue found with ID **${shortId}**.` });
+    }
+
+    if (issue.status === 'resolved' || issue.status === 'closed') {
+      return interaction.editReply({
+        content: `**${shortId}** is already ${issue.status}.`
+      });
+    }
+
+    const success = await updateStatus({
+      issueId:   issue.id,
+      newStatus: 'closed',
+      changedBy: interaction.user.id,
+      note:      reason
+    });
+
+    if (!success) {
+      return interaction.editReply({ content: `Failed to close issue. Try again.` });
+    }
+
+    // Notify user in thread + DM
+    await notifyUser(interaction.client, issue, 'closed', reason);
+
+    await interaction.editReply({
+      content: `**${shortId}** has been closed. User has been notified.`
+    });
+  }
+};
+```
+
+---
+
+## Step 7 — Update `commands/resolve.js` and `commands/acknowledge.js`
+
+Both need to use the new `notifyUser` instead of the old `postStatusUpdate`. Replace both files entirely:
+
+**`commands/resolve.js`:**
+
+```js
+const { SlashCommandBuilder, MessageFlags } = require('discord.js');
+const { getIssueByShortId, updateStatus } = require('../lib/issues');
+const { notifyUser } = require('../lib/notify');
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('resolve')
+    .setDescription('Mark an issue as resolved (team only)')
+    .addStringOption(opt =>
+      opt.setName('issue_id')
+        .setDescription('Issue ID e.g. ISS-1001')
+        .setRequired(true)
+    )
+    .addStringOption(opt =>
+      opt.setName('note')
+        .setDescription('Resolution note to share with the user')
+        .setRequired(false)
+    ),
+
+  async execute(interaction) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const shortId = interaction.options.getString('issue_id').toUpperCase();
+    const note    = interaction.options.getString('note') || 'Your issue has been resolved.';
+    const issue   = await getIssueByShortId(shortId);
+
+    if (!issue) {
+      return interaction.editReply({ content: `No issue found with ID **${shortId}**.` });
+    }
+
+    if (issue.status === 'resolved' || issue.status === 'closed') {
+      return interaction.editReply({
+        content: `**${shortId}** is already ${issue.status}.`
+      });
+    }
+
+    const success = await updateStatus({
+      issueId:   issue.id,
+      newStatus: 'resolved',
+      changedBy: interaction.user.id,
+      note
+    });
+
+    if (!success) {
+      return interaction.editReply({ content: `Failed to update status. Try again.` });
+    }
+
+    await notifyUser(interaction.client, issue, 'resolved', note);
+
+    await interaction.editReply({
+      content: `**${shortId}** marked as resolved. User has been notified via thread and DM.`
+    });
+  }
+};
+```
+
+**`commands/acknowledge.js`:**
+
+```js
+const { SlashCommandBuilder, MessageFlags } = require('discord.js');
+const { getIssueByShortId, updateStatus } = require('../lib/issues');
+const { notifyUser } = require('../lib/notify');
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('acknowledge')
+    .setDescription('Mark an issue as acknowledged (team only)')
+    .addStringOption(opt =>
+      opt.setName('issue_id')
+        .setDescription('Issue ID e.g. ISS-1001')
+        .setRequired(true)
+    ),
+
+  async execute(interaction) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const shortId = interaction.options.getString('issue_id').toUpperCase();
+    const issue   = await getIssueByShortId(shortId);
+
+    if (!issue) {
+      return interaction.editReply({ content: `No issue found with ID **${shortId}**.` });
+    }
+
+    if (issue.status !== 'open') {
+      return interaction.editReply({
+        content: `**${shortId}** is already ${issue.status} — no need to acknowledge again.`
+      });
+    }
+
+    await updateStatus({
+      issueId:   issue.id,
+      newStatus: 'acknowledged',
+      changedBy: interaction.user.id,
+      note:      'Issue acknowledged by team'
+    });
+
+    await notifyUser(
+      interaction.client,
+      issue,
+      'acknowledged',
+      'A team member has seen your issue and will look into it.'
+    );
+
+    await interaction.editReply({
+      content: `**${shortId}** marked as acknowledged. User has been notified via thread and DM.`
+    });
+  }
+};
+```
+
+---
+
+## Step 8 — Update `index.js`
+
+Add duplicate detection to `handleReportModal`, wire up the reminder job, and fix the deprecation warnings. Replace your entire `index.js`:
+
+```js
+require('dotenv').config();
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  Collection,
+  ChannelType,
+  MessageFlags
+} = require('discord.js');
+const fs = require('fs');
+const {
+  createIssue,
+  attachThread,
+  saveMessage,
+  isAtIssueLimit,
+  findSimilarOpenIssue
+} = require('./lib/issues');
+const { forwardToTeam, pingRoleInThread } = require('./lib/forward');
+const { createReportThread }              = require('./lib/forum');
+const { runReminderJob }                  = require('./lib/reminders');
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
+  ],
+  partials: [Partials.Channel]
+});
+
+// Load commands
+client.commands = new Collection();
+const commandFiles = fs.readdirSync('./commands').filter(f => f.endsWith('.js'));
+for (const file of commandFiles) {
+  const command = require(`./commands/${file}`);
+  client.commands.set(command.data.name, command);
+}
+
+client.once('clientReady', () => {
+  console.log(`Online as ${client.user.tag}`);
+
+  // Run reminder job every hour
+  setInterval(() => runReminderJob(client), 60 * 60 * 1000);
+
+  // Also run once 30 seconds after startup to catch anything stale
+  setTimeout(() => runReminderJob(client), 30 * 1000);
+});
+
+client.on('interactionCreate', async interaction => {
+
+  if (interaction.isChatInputCommand()) {
+    const command = client.commands.get(interaction.commandName);
+    if (!command) return;
+    try {
+      await command.execute(interaction);
+    } catch (err) {
+      console.error(`Error in /${interaction.commandName}:`, err);
+      const msg = { content: 'Something went wrong. Please try again.', flags: MessageFlags.Ephemeral };
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp(msg);
+      } else {
+        await interaction.reply(msg);
+      }
+    }
+    return;
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId === 'report_modal') {
+    await handleReportModal(interaction);
+    return;
+  }
+});
+
+async function handleReportModal(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const title       = interaction.fields.getTextInputValue('issue_title');
+  const description = interaction.fields.getTextInputValue('issue_description');
+  const stepsTried  = interaction.fields.getTextInputValue('issue_steps') || null;
+  const user        = interaction.user;
+
+  // Check issue limit
+  const atLimit = await isAtIssueLimit(user.id);
+  if (atLimit) {
+    return interaction.editReply({
+      content: [
+        `You already have 3 open issues — the maximum allowed.`,
+        `Use \`/myissues\` to see them. A team member needs to resolve one before you can open another.`
+      ].join('\n')
+    });
+  }
+
+  // Check for duplicate
+  const similar = await findSimilarOpenIssue(user.id, title);
+  if (similar) {
+    return interaction.editReply({
+      content: [
+        `You may already have a similar open issue: **${similar.short_id}** — "${similar.title}"`,
+        ``,
+        `If this is the same problem, use \`/status ${similar.short_id}\` to check on it.`,
+        `If this is a different issue, please add more specific detail to the title and try again.`
+      ].join('\n')
+    });
+  }
+
+  // Create issue
+  let issue;
+  try {
+    issue = await createIssue({
+      user,
+      guild:   interaction.guild,
+      channel: interaction.channel,
+      title,
+      description,
+      stepsTried
+    });
+  } catch (err) {
+    console.error('createIssue failed:', err.message);
+    return interaction.editReply({
+      content: 'Something went wrong saving your issue. Please try again.'
+    });
+  }
+
+  // Save initial message
+  await saveMessage({
+    issueId: issue.id,
+    role:    'user',
+    content: `Title: ${title}\nDescription: ${description}\nSteps tried: ${stepsTried || 'None'}`
+  });
+
+  // Create forum thread
+  const thread = await createReportThread(interaction.client, issue, user);
+
+  if (thread) {
+    await attachThread(issue.id, thread.id);
+    issue.thread_id = thread.id;
+
+    await saveMessage({
+      issueId:      issue.id,
+      role:         'assistant',
+      content:      `Issue ${issue.short_id} forum post created.`,
+      discordMsgId: thread.id
+    });
+
+    // Wait for thread to initialize then ping role
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    try {
+      const liveThread = await interaction.client.channels.fetch(thread.id);
+      await pingRoleInThread(interaction.client, liveThread, issue, 'new_issue');
+    } catch (err) {
+      console.error('Could not ping role in thread:', err.message);
+    }
+  }
+
+  // Forward to department channel
+  await forwardToTeam(interaction.client, issue, user);
+
+  // Reply to user
+  const lines = [
+    `Your issue has been reported as **${issue.short_id}**.`,
+    `Department: **${issue.department}**`,
+    ``
+  ];
+
+  if (thread) lines.push(`Your thread: <#${thread.id}>`);
+
+  lines.push(`Use \`/status ${issue.short_id}\` to check for updates.`);
+  lines.push(`Use \`/myissues\` to see all your open issues.`);
+
+  await interaction.editReply({ content: lines.join('\n') });
+}
+
+client.login(process.env.DISCORD_TOKEN);
+```
+
+---
+
+## Step 9 — Register New Commands and Restart
+
+```bash
+node deploy-commands.js
+node index.js
+```
+
+---
+
+## What To Test
+
+**Test 1 — Duplicate detection**
+Submit `/report` with title `payment keeps failing`. Then immediately submit another `/report` with title `payment failing again`. Second one should be blocked and show the existing issue ID.
+
+**Test 2 — DM notification**
+Run `/acknowledge ISS-xxxx` on any open issue. Check two places: the forum thread should have a new status message, and your Discord DMs should have a message from the bot.
+
+**Test 3 — Close command**
+Run `/close ISS-xxxx reason:Duplicate report`. User gets DM'd and thread gets the closed message. `/status` should now show closed.
+
+**Test 4 — Stale reminder (force test)**
+In Supabase SQL Editor run this to fake a stale issue:
+
+```sql
+update issues
+set updated_at = now() - interval '49 hours',
+    reminder_count = 0
+where status = 'open'
+limit 1;
+```
+
+Then restart the bot — the reminder job runs 30 seconds after startup. Check the terminal for `[reminders] Found 1 stale issue(s)` and check the forum thread for the reminder message.
+
+**Test 5 — Issue limit message**
+Make sure the limit message now correctly says a team member needs to resolve one rather than the user being able to close it themselves.
+
+All 5 pass and V4 is done.
