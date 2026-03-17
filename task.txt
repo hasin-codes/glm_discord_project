@@ -1,60 +1,85 @@
-// ─── Thread message listener ──────────────────────────────────────────
-// Drop this entire block into index.js replacing the existing messageCreate handler
+Ah—I see exactly what’s happening. The root cause here is that your code sets `VECTOR_SIZE = 256`, but your embedding model (`Qwen3-embedding-0.6b`) is actually producing **1024-dimensional vectors**. That mismatch is why your collection isn’t aligned with your expected vector size and why any stored vectors may appear as zeros (because Qdrant rejects vectors with the wrong length or fills with zeros in some cases).
 
-client.on('messageCreate', async message => {
+Here’s the breakdown:
 
-  // Ignore bots
-  if (message.author.bot) return;
+---
 
-  // Only care about threads
-  if (!message.channel.isThread()) return;
+### 1. Wrong vector size in `createCollection`
 
-  const thread = message.channel;
+```js
+const VECTOR_SIZE = 256; // ❌ should match your embedding output
+```
 
-  // Only threads inside our report forum
-  if (thread.parentId !== process.env.BAD_REPORT_CHANNEL_ID) return;
+* `Qwen3-embedding-0.6b` outputs **1024-dimensional vectors**, not 256.
+* So your collection should be created like:
 
-  const content = message.content.trim();
-  if (!content || content.length < 8) return; // ignore very short messages
+```js
+const VECTOR_SIZE = 1024;
+```
 
-  const isMention = message.mentions.has(client.user.id);
+---
 
-  // Passive monitoring — only trigger on clear questions or requests for help
-  // Does NOT trigger on: hi, hello, thanks, random text, statements
-  const isQuestion = /\?$/.test(content); // ends with question mark
-  const isHelpRequest =
-    /^(how|what|why|when|where|can you|could you|do you|does|is there|are there|i need|i cant|i can't|help me|please help)/i
-    .test(content);
+### 2. If collection already exists with wrong size
 
-  // Must be either a mention OR a genuine question/help request
-  if (!isMention && !isQuestion && !isHelpRequest) return;
+* Qdrant **cannot change vector size** of an existing collection.
+* If `docs_chunks` was already created with 256 dimensions, you must **drop it** or create a new collection:
 
-  // Minimum length for passive monitoring (mentions bypass this)
-  if (!isMention && content.length < 15) return;
+```js
+await client.deleteCollection('docs_chunks');
+await ensureCollection('docs_chunks'); // now with correct VECTOR_SIZE
+```
 
-  // Find the issue this thread belongs to
-  const { data: issue } = await supabase
-    .from('issues')
-    .select('*')
-    .eq('thread_id', thread.id)
-    .maybeSingle();
+---
 
-  if (!issue) return;
+### 3. Ensure you store real embeddings
 
-  // Don't answer resolved/closed issues
-  if (issue.status === 'resolved' || issue.status === 'closed') return;
+* When you generate embeddings, make sure the vector you pass has the correct length (1024).
+* Example upsert check:
 
-  // Save user message
-  await saveMessage({
-    issueId:      issue.id,
-    role:         'user',
-    content,
-    discordMsgId: message.id
-  });
+```js
+const embedding = await getEmbedding("your text"); // returns 1024 floats
+console.log(embedding.length); // should print 1024
 
-  // Show typing indicator
-  await thread.sendTyping();
+await upsert('docs_chunks', [{
+  id: '1',
+  vector: embedding,
+  payload: { text: "your text" }
+}]);
+```
 
-  // Run RAG
-  await answerInThread(client, thread, issue, content);
-});
+* Then verify via your scroll command:
+
+```bash
+node -e "
+require('dotenv').config();
+const { QdrantClient } = require('@qdrant/js-client-rest');
+const c = new QdrantClient({ url: process.env.QDRANT_URL, apiKey: process.env.QDRANT_API_KEY });
+c.scroll('docs_chunks', { limit: 1, with_vectors: true })
+  .then(r => {
+    const v = r.points[0].vector;
+    console.log('Vector length:', v.length);
+    console.log('First 5:', v.slice(0, 5));
+    console.log('All zeros?', v.every(x => x === 0));
+  })
+  .catch(e => console.error(e.message));
+"
+```
+
+You should now see:
+
+```
+Vector length: 1024
+First 5: [0.003, -0.002, ...]  // actual float values
+All zeros? false
+```
+
+---
+
+✅ **Summary of Fixes**
+
+1. Change `VECTOR_SIZE = 1024`.
+2. Drop any existing collection created with 256 dimensions.
+3. Recreate collections with correct vector size.
+4. Make sure you upsert real embeddings of length 1024.
+
+---
