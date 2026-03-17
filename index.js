@@ -27,6 +27,7 @@ const { startWorkers, stopWorkers }       = require('./lib/workers');
 const { addForwardJob }                   = require('./lib/queue');
 const { initCollections }                 = require('./lib/qdrant');
 const { answerInThread }                  = require('./lib/rag');
+const supabase                            = require('./lib/supabase');
 
 // ─── Client setup ────────────────────────────────────────────────────
 const client = new Client({
@@ -217,46 +218,52 @@ client.on('threadCreate', async (thread, newlyCreated) => {
 });
 
 // ─── Thread message listener ──────────────────────────────────────────
-// Watches messages inside issue threads and triggers RAG answering
+// Drop this entire block into index.js replacing the existing messageCreate handler
+
 client.on('messageCreate', async message => {
 
-  // Ignore bots (including itself)
+  // Ignore bots
   if (message.author.bot) return;
 
-  // Only care about messages inside threads
+  // Only care about threads
   if (!message.channel.isThread()) return;
 
   const thread = message.channel;
 
-  // Only handle threads that are inside our forum channel
+  // Only threads inside our report forum
   if (thread.parentId !== process.env.BAD_REPORT_CHANNEL_ID) return;
 
   const content = message.content.trim();
-  if (!content) return;
+  if (!content || content.length < 8) return; // ignore very short messages
 
   const isMention = message.mentions.has(client.user.id);
 
-  // If mentioned — answer immediately regardless
-  // If not mentioned — only answer if message looks like a question
-  const isQuestion = content.endsWith('?') ||
-    /^(how|what|why|when|where|can|does|is|are|do|will|should|could)/i.test(content);
+  // Passive monitoring — only trigger on clear questions or requests for help
+  // Does NOT trigger on: hi, hello, thanks, random text, statements
+  const isQuestion = /\?$/.test(content); // ends with question mark
+  const isHelpRequest =
+    /^(how|what|why|when|where|can you|could you|do you|does|is there|are there|i need|i cant|i can't|help me|please help)/i
+    .test(content);
 
-  if (!isMention && !isQuestion) return;
+  // Must be either a mention OR a genuine question/help request
+  if (!isMention && !isQuestion && !isHelpRequest) return;
+
+  // Minimum length for passive monitoring (mentions bypass this)
+  if (!isMention && content.length < 15) return;
 
   // Find the issue this thread belongs to
-  const supabase = require('./lib/supabase');
   const { data: issue } = await supabase
     .from('issues')
     .select('*')
     .eq('thread_id', thread.id)
     .maybeSingle();
 
-  if (!issue) return; // thread not linked to an issue — ignore
+  if (!issue) return;
 
-  // Don't answer already resolved/closed issues
+  // Don't answer resolved/closed issues
   if (issue.status === 'resolved' || issue.status === 'closed') return;
 
-  // Save user message to history
+  // Save user message
   await saveMessage({
     issueId:      issue.id,
     role:         'user',
@@ -264,7 +271,7 @@ client.on('messageCreate', async message => {
     discordMsgId: message.id
   });
 
-  // Show typing indicator while we work
+  // Show typing indicator
   await thread.sendTyping();
 
   // Run RAG

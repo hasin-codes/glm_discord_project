@@ -1,13 +1,13 @@
 require('dotenv').config();
 const fs   = require('fs');
 const path = require('path');
-const { embedBatch }          = require('../lib/cloudflare');
-const { upsert, ensureCollection, COLLECTIONS } = require('../lib/qdrant');
-const { v4: uuidv4 }          = require('uuid');
+const { embedBatch }                       = require('../lib/cloudflare');
+const { upsert, ensureCollection, COLLECTIONS, VECTOR_SIZE } = require('../lib/qdrant');
+const { v4: uuidv4 }                       = require('uuid');
 
-const DOCS_DIR    = path.join(__dirname, '../docs');
-const CHUNK_SIZE  = 400;  // words per chunk
-const CHUNK_OVERLAP = 50; // word overlap between chunks
+const DOCS_DIR      = path.join(__dirname, '../docs');
+const CHUNK_SIZE    = 400;
+const CHUNK_OVERLAP = 50;
 
 function chunkText(text, size, overlap) {
   const words  = text.split(/\s+/);
@@ -15,7 +15,7 @@ function chunkText(text, size, overlap) {
 
   for (let i = 0; i < words.length; i += (size - overlap)) {
     const chunk = words.slice(i, i + size).join(' ');
-    if (chunk.trim().length > 50) { // skip tiny chunks
+    if (chunk.trim().length > 50) {
       chunks.push(chunk);
     }
     if (i + size >= words.length) break;
@@ -38,52 +38,73 @@ async function ingestFile(filePath) {
     return;
   }
 
-  // Embed all chunks in one batch call
-  const embeddings = await embedBatch(chunks);
+  // Embed all chunks
+  console.log(`  → Embedding ${chunks.length} chunks via Cloudflare...`);
+  let embeddings;
+  try {
+    embeddings = await embedBatch(chunks);
+  } catch (err) {
+    console.error(`  → Embedding failed:`, err.message);
+    throw err;
+  }
 
-  // Build Qdrant points
+  // Verify dimensions match what Qdrant expects
+  const actualDim = embeddings[0]?.length;
+  if (actualDim !== VECTOR_SIZE) {
+    console.error(`  → Dimension mismatch! Got ${actualDim}, expected ${VECTOR_SIZE}`);
+    console.error(`  → Update VECTOR_SIZE in lib/qdrant.js to ${actualDim} and re-run`);
+    throw new Error(`Vector dimension mismatch: got ${actualDim}, expected ${VECTOR_SIZE}`);
+  }
+
+  console.log(`  → Vector dimensions: ${actualDim} ✓`);
+
   const points = chunks.map((chunk, i) => ({
     id:      uuidv4(),
     vector:  embeddings[i],
     payload: {
-      content:  chunk,
-      source:   filename,
+      content:     chunk,
+      source:      filename,
       chunk_index: i,
       ingested_at: new Date().toISOString()
     }
   }));
 
   await upsert(COLLECTIONS.docs, points);
-  console.log(`  → Upserted ${points.length} points into Qdrant`);
+  console.log(`  → Upserted ${points.length} points into Qdrant ✓`);
 }
 
 async function main() {
   console.log('Starting doc ingestion...');
+  console.log(`Qdrant URL: ${process.env.QDRANT_URL}`);
+  console.log(`CF Account: ${process.env.CF_ACCOUNT_ID ? 'set' : 'MISSING'}`);
+  console.log(`CF Token:   ${process.env.CF_API_TOKEN ? 'set' : 'MISSING'}`);
 
-  // Make sure the collection exists
+  // Ensure collection exists before upserting
   await ensureCollection(COLLECTIONS.docs);
 
   if (!fs.existsSync(DOCS_DIR)) {
     fs.mkdirSync(DOCS_DIR, { recursive: true });
-    console.log(`Created /docs folder — add your markdown files there and run again`);
+    console.log(`\nCreated /docs folder — add your .md files there and run again`);
     return;
   }
 
   const files = fs.readdirSync(DOCS_DIR).filter(f => f.endsWith('.md'));
 
   if (files.length === 0) {
-    console.log('No .md files found in /docs — add some and run again');
+    console.log('\nNo .md files found in /docs — add some and run again');
     return;
   }
+
+  console.log(`\nFound ${files.length} file(s): ${files.join(', ')}`);
 
   for (const file of files) {
     await ingestFile(path.join(DOCS_DIR, file));
   }
 
-  console.log('\nIngestion complete.');
+  console.log('\nIngestion complete ✓');
 }
 
 main().catch(err => {
-  console.error('Ingestion failed:', err);
+  console.error('\nIngestion failed:', err.message);
   process.exit(1);
 });
