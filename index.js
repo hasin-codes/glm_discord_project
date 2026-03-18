@@ -239,10 +239,15 @@ client.on('messageCreate', async message => {
   if (!issue) return;
   if (issue.status === 'resolved' || issue.status === 'closed') return;
 
-  await thread.sendTyping();
+  // Save user message BEFORE running agent so history is complete
+  await saveMessage({
+    issueId:      issue.id,
+    role:         'user',
+    content,
+    discordMsgId: message.id
+  });
 
-  // runAgent handles saving messages internally for non-casual intents
-  // For casual, it also saves. So we don't save here.
+  await thread.sendTyping();
   await runAgent(client, thread, issue, content);
 });
 
