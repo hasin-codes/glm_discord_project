@@ -1,6 +1,7 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
-const { getIssueByShortId, updateStatus } = require('../lib/issues');
+const { getIssueByShortId, updateStatus, getAllThreadIssues } = require('../lib/issues');
 const { addNotifyJob } = require('../lib/queue');
+const { unpinEscalationEmbed, updateThreadBrief } = require('../lib/context');
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -21,8 +22,8 @@ module.exports = {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const shortId = interaction.options.getString('issue_id');
-    const reason  = interaction.options.getString('reason') || 'Closed by support team.';
-    const issue   = await getIssueByShortId(shortId);
+    const reason = interaction.options.getString('reason') || 'Closed by support team.';
+    const issue = await getIssueByShortId(shortId);
 
     if (!issue) {
       return interaction.editReply({ content: `No issue found with ID **${shortId}**.` });
@@ -35,20 +36,35 @@ module.exports = {
     }
 
     const success = await updateStatus({
-      issueId:   issue.id,
+      issueId: issue.id,
       newStatus: 'closed',
       changedBy: interaction.user.id,
-      note:      reason
+      note: reason
     });
 
     if (!success) {
       return interaction.editReply({ content: `Failed to close issue. Try again.` });
     }
 
+    // V6.81: Unpin escalation embed when issue is closed
+    if (issue.thread_id) {
+      try {
+        const thread = await interaction.client.channels.fetch(issue.thread_id);
+        if (thread) {
+          await unpinEscalationEmbed(thread);
+          // Fix 5: Update thread brief on close
+          const allIssues = await getAllThreadIssues(issue.thread_id);
+          await updateThreadBrief(thread, allIssues, interaction.client.user.id);
+        }
+      } catch (err) {
+        console.warn(`[close] Could not update thread for ${issue.short_id}:`, err.message);
+      }
+    }
+
     await addNotifyJob({
-      issueId:   issue.short_id,
+      issueId: issue.short_id,
       newStatus: 'closed',
-      note:      reason
+      note: reason
     });
 
     await interaction.editReply({

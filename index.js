@@ -7,7 +7,7 @@ const {
   ChannelType,
   MessageFlags
 } = require('discord.js');
-const fs   = require('fs');
+const fs = require('fs');
 const pino = require('pino');
 
 const log = pino({ level: 'info' }, pino.destination(1));
@@ -17,17 +17,19 @@ const {
   attachThread,
   saveMessage,
   isAtIssueLimit,
-  findSimilarOpenIssue
+  findSimilarOpenIssue,
+  getAllThreadIssues
 } = require('./lib/issues');
 
 const { forwardToTeam, pingRoleInThread } = require('./lib/forward');
-const { createReportThread }              = require('./lib/forum');
-const { runReminderJob }                  = require('./lib/reminders');
-const { startWorkers, stopWorkers }       = require('./lib/workers');
-const { addForwardJob }                   = require('./lib/queue');
-const { initCollections }                 = require('./lib/qdrant');
-const { runAgent }                       = require('./lib/agent');
-const supabase                            = require('./lib/supabase');
+const { createReportThread } = require('./lib/forum');
+const { runReminderJob } = require('./lib/reminders');
+const { startWorkers, stopWorkers } = require('./lib/workers');
+const { addForwardJob } = require('./lib/queue');
+const { initCollections } = require('./lib/qdrant');
+const { runAgent } = require('./lib/agent');
+const { updateThreadBrief } = require('./lib/context');
+const supabase = require('./lib/supabase');
 
 // ─── Client setup ────────────────────────────────────────────────────
 const client = new Client({
@@ -115,8 +117,8 @@ client.on('threadCreate', async (thread, newlyCreated) => {
     return;
   }
 
-  const user          = starterMessage.author;
-  const threadTitle   = thread.name;
+  const user = starterMessage.author;
+  const threadTitle = thread.name;
   const threadContent = starterMessage.content || 'No description provided';
 
   // Skip bot authors
@@ -157,11 +159,11 @@ client.on('threadCreate', async (thread, newlyCreated) => {
   try {
     issue = await createIssue({
       user,
-      guild:       thread.guild,
-      channel:     { id: thread.parentId },
-      title:       threadTitle,
+      guild: thread.guild,
+      channel: { id: thread.parentId },
+      title: threadTitle,
       description: threadContent,
-      stepsTried:  null
+      stepsTried: null
     });
   } catch (err) {
     console.error('[threadCreate] createIssue failed:', err.message);
@@ -173,7 +175,7 @@ client.on('threadCreate', async (thread, newlyCreated) => {
 
   await saveMessage({
     issueId: issue.id,
-    role:    'user',
+    role: 'user',
     content: `Title: ${threadTitle}\nDescription: ${threadContent}`
   });
 
@@ -181,9 +183,9 @@ client.on('threadCreate', async (thread, newlyCreated) => {
   issue.thread_id = thread.id;
 
   await saveMessage({
-    issueId:      issue.id,
-    role:         'assistant',
-    content:      `Issue ${issue.short_id} auto-detected from user-created forum thread.`,
+    issueId: issue.id,
+    role: 'assistant',
+    content: `Issue ${issue.short_id} auto-detected from user-created forum thread.`,
     discordMsgId: thread.id
   });
 
@@ -211,8 +213,16 @@ client.on('threadCreate', async (thread, newlyCreated) => {
   // Queue the forward job instead of calling directly
   await addForwardJob({
     issueId: issue.short_id,
-    userId:  user.id
+    userId: user.id
   });
+
+  // Fix 2: Create initial thread brief
+  try {
+    const allIssues = await getAllThreadIssues(thread.id);
+    await updateThreadBrief(thread, allIssues, client.user.id);
+  } catch (err) {
+    console.warn('[threadCreate] Could not create initial brief:', err.message);
+  }
 
   console.log(`[threadCreate] Issue ${issue.short_id} created and processed`);
 });
@@ -230,25 +240,53 @@ client.on('messageCreate', async message => {
   const content = message.content.trim();
   if (!content) return;
 
-  const { data: issue } = await supabase
+  // ── Fix 1: Multi-user routing ──────────────────────────────────────
+  // First, look for the PRIMARY issue in this thread
+  const { data: primaryIssue } = await supabase
     .from('issues')
     .select('*')
     .eq('thread_id', thread.id)
+    .order('created_at', { ascending: true })
+    .limit(1)
     .maybeSingle();
 
-  if (!issue) return;
-  if (issue.status === 'resolved' || issue.status === 'closed') return;
+  if (!primaryIssue) return;
+
+  // Check if this author already has their OWN issue in this thread (sub-issue)
+  const { findIssueForAuthorInThread } = require('./lib/issues');
+  const authorIssue = await findIssueForAuthorInThread(thread.id, message.author.id);
+
+  // Use the author's own issue if it exists, otherwise use the primary issue
+  // (The agent will detect if a new user needs a sub-issue created)
+  const issue = authorIssue || primaryIssue;
+
+  if (issue.status === 'resolved' || issue.status === 'closed') {
+    // If the author's own sub-issue is resolved but the primary isn't,
+    // still let the message through under the primary issue
+    if (authorIssue && primaryIssue.status !== 'resolved' && primaryIssue.status !== 'closed') {
+      // Fall through with primary issue
+    } else {
+      return;
+    }
+  }
+
+  // Determine the effective issue for this message
+  const effectiveIssue = (issue.status === 'resolved' || issue.status === 'closed')
+    ? primaryIssue
+    : issue;
 
   // Save user message BEFORE running agent so history is complete
   await saveMessage({
-    issueId:      issue.id,
-    role:         'user',
+    issueId: effectiveIssue.id,
+    role: 'user',
     content,
     discordMsgId: message.id
   });
 
   await thread.sendTyping();
-  await runAgent(client, thread, issue, content);
+  // Pass member for staff role check; fall back to author ID if member not cached
+  // Always pass the PRIMARY issue to runAgent — it handles sub-issue routing internally
+  await runAgent(client, thread, primaryIssue, content, message.member || { id: message.author.id });
 });
 
 // ─── Interaction handler ──────────────────────────────────────────────
@@ -264,7 +302,7 @@ client.on('interactionCreate', async interaction => {
       console.error(`Error in /${interaction.commandName}:`, err);
       const msg = {
         content: 'Something went wrong. Please try again.',
-        flags:   MessageFlags.Ephemeral
+        flags: MessageFlags.Ephemeral
       };
       if (interaction.replied || interaction.deferred) {
         await interaction.followUp(msg);
@@ -285,10 +323,10 @@ client.on('interactionCreate', async interaction => {
 async function handleReportModal(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  const title       = interaction.fields.getTextInputValue('issue_title');
+  const title = interaction.fields.getTextInputValue('issue_title');
   const description = interaction.fields.getTextInputValue('issue_description');
-  const stepsTried  = interaction.fields.getTextInputValue('issue_steps') || null;
-  const user        = interaction.user;
+  const stepsTried = interaction.fields.getTextInputValue('issue_steps') || null;
+  const user = interaction.user;
 
   // Check open issue limit
   const atLimit = await isAtIssueLimit(user.id);
@@ -319,7 +357,7 @@ async function handleReportModal(interaction) {
   try {
     issue = await createIssue({
       user,
-      guild:   interaction.guild,
+      guild: interaction.guild,
       channel: interaction.channel,
       title,
       description,
@@ -335,7 +373,7 @@ async function handleReportModal(interaction) {
   // Save initial user message
   await saveMessage({
     issueId: issue.id,
-    role:    'user',
+    role: 'user',
     content: `Title: ${title}\nDescription: ${description}\nSteps tried: ${stepsTried || 'None'}`
   });
 
@@ -347,9 +385,9 @@ async function handleReportModal(interaction) {
     issue.thread_id = thread.id;
 
     await saveMessage({
-      issueId:      issue.id,
-      role:         'assistant',
-      content:      `Issue ${issue.short_id} thread created via /report.`,
+      issueId: issue.id,
+      role: 'assistant',
+      content: `Issue ${issue.short_id} thread created via /report.`,
       discordMsgId: thread.id
     });
 
@@ -359,15 +397,19 @@ async function handleReportModal(interaction) {
     try {
       const liveThread = await interaction.client.channels.fetch(thread.id);
       await pingRoleInThread(interaction.client, liveThread, issue, 'new_issue');
+
+      // Fix 2: Create initial thread brief
+      const allIssues = await getAllThreadIssues(thread.id);
+      await updateThreadBrief(liveThread, allIssues, interaction.client.user.id);
     } catch (err) {
-      console.error('Could not ping role in thread:', err.message);
+      console.error('Could not ping role or create brief in thread:', err.message);
     }
   }
 
   // Queue the forward job instead of calling directly
   await addForwardJob({
     issueId: issue.short_id,
-    userId:  user.id
+    userId: user.id
   });
 
   // Ephemeral reply to user
