@@ -97,10 +97,17 @@ async function runPipeline() {
   try {
     // Determine time window
     const lastBatch = await batchTracker.getLastBatch();
+    const forceFull = process.env.FORCE_FULL_PIPELINE === 'true';
+
     let startTimeISO;
     let endTimeISO;
 
-    if (lastBatch && lastBatch.endTimestamp) {
+    if (forceFull) {
+      logger.info('orchestrator', 'FORCE_FULL_PIPELINE is true — wiping Redis cursor and fetching ALL history');
+      await batchTracker.setLastBatch('force-wipe', null); // Wipe tracker
+      startTimeISO = null;
+      endTimeISO = null;
+    } else if (lastBatch && lastBatch.endTimestamp) {
       // Normal incremental run — process messages since last batch
       startTimeISO = lastBatch.endTimestamp;
       endTimeISO = new Date().toISOString();
@@ -109,7 +116,6 @@ async function runPipeline() {
       });
     } else {
       // FIRST RUN or degraded mode (no Redis) — process ALL existing data
-      // Don't guess a time window; just fetch everything in the clean table
       startTimeISO = null;
       endTimeISO = null;
       logger.info('orchestrator', 'First run — fetching ALL existing cleaned messages (no time filter)');

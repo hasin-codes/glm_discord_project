@@ -88,36 +88,38 @@ client.once('clientReady', async () => {
   //
   // On startup: run pipeline once to process existing/new cleaned messages
   // Then schedule to run every 12 hours for incremental processing
+  const { runPipeline } = require('./pipeline/src/index');
+
+  // Always schedule pipeline every 12h regardless of first-run outcome
+  setInterval(async () => {
+    try {
+      log.info('[pipeline] Running scheduled pipeline...');
+      await runPipeline();
+      log.info('[pipeline] Scheduled pipeline complete');
+    } catch (err) {
+      log.error('[pipeline] Scheduled pipeline failed:', {
+        message: err.message,
+        stack: err.stack?.slice(0, 500),
+      });
+      // Don't crash bot — retry at next interval
+    }
+  }, 12 * 60 * 60 * 1000); // 12 hours
+
+  // Run immediately on startup (1 min delay to let bot fully initialize)
   setTimeout(async () => {
     try {
       log.info('[pipeline] Running initial pipeline on startup...');
-      const { runPipeline } = require('./pipeline/src/index');
       await runPipeline();
       log.info('[pipeline] Initial pipeline complete');
-
-      // Schedule pipeline to run every 12 hours for incremental processing
-      setInterval(async () => {
-        try {
-          log.info('[pipeline] Running scheduled pipeline...');
-          await runPipeline();
-          log.info('[pipeline] Scheduled pipeline complete');
-        } catch (err) {
-          log.error('[pipeline] Scheduled pipeline failed:', {
-            message: err.message,
-            stack: err.stack?.slice(0, 500),
-          });
-        }
-      }, 12 * 60 * 60 * 1000); // 12 hours
-
     } catch (err) {
       log.error('[pipeline] Initial pipeline failed:', {
         message: err.message,
         stack: err.stack?.slice(0, 1000),
         code: err.code,
       });
-      // Don't crash bot — pipeline failure is non-critical
+      // Don't crash bot — will retry in 12 hours
     }
-  }, 60000); // Wait 1 minute after bot starts
+  }, 60000);
 
   log.info('Bot ready — pipeline runs on Railway, cleaning/retention via edge functions');
 });
