@@ -98,7 +98,10 @@ async function runPipeline() {
     if (lastBatch && lastBatch.endTimestamp) {
       startTimeISO = lastBatch.endTimestamp;
     } else {
-      startTimeISO = new Date(Date.now() - windowHours * 3600 * 1000).toISOString();
+      // First deploy — do a full backfill (30 days) instead of a small window
+      const backfillDays = parseInt(process.env.PIPELINE_INITIAL_BACKFILL_DAYS, 10) || 30;
+      startTimeISO = new Date(Date.now() - backfillDays * 24 * 3600 * 1000).toISOString();
+      logger.info('orchestrator', `No previous batch found — running initial backfill (${backfillDays} days)`);
     }
     const endTimeISO = new Date().toISOString();
 

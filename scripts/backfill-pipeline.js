@@ -11,15 +11,19 @@
  */
 
 require('dotenv').config();
-const { runPipeline } = require('../pipeline/src/index');
 
 async function backfill() {
   console.log('🚀 Starting backfill pipeline...');
   console.log('Processing last 30 days of messages...');
   
-  // Override to process last 30 days
-  const originalHours = process.env.PIPELINE_BACKFILL_HOURS;
+  // Set backfill hours BEFORE requiring runPipeline
   process.env.PIPELINE_BACKFILL_HOURS = '720'; // 30 days
+  
+  // Force reload of pipeline config
+  delete require.cache[require.resolve('../pipeline/src/index')];
+  delete require.cache[require.resolve('../pipeline/pipeline.config')];
+  
+  const { runPipeline } = require('../pipeline/src/index');
   
   try {
     await runPipeline();
@@ -34,8 +38,6 @@ async function backfill() {
     console.error('❌ Backfill failed:', err.message);
     console.error(err.stack);
     process.exit(1);
-  } finally {
-    process.env.PIPELINE_BACKFILL_HOURS = originalHours;
   }
 }
 
