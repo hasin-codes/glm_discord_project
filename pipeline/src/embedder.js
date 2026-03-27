@@ -71,23 +71,23 @@ function sleepWithJitter(baseMs) {
 }
 
 /**
- * Embed a single text with retry logic. Returns normalized vector or null on permanent failure.
- * @param {string} text
- * @returns {Promise<number[]|null>}
+ * Helper to embed a batch of texts with retry logic.
+ * @param {string[]} texts
+ * @returns {Promise<number[][]|null>} array of normalized vectors, or null if batch failed
  */
-async function embedSingleWithRetry(text) {
+async function embedBatchWithRetry(texts) {
   const maxRetries = PIPELINE_CONFIG.EMBEDDING_MAX_RETRIES;
   const baseDelay = PIPELINE_CONFIG.EMBEDDING_RETRY_BASE_MS;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const [vec] = await callEmbeddingAPI([text], 10000);
-      return normalize(vec);
+      const vectors = await callEmbeddingAPI(texts, 30000);
+      return vectors.map(vec => normalize(vec));
     } catch (err) {
       const isLast = attempt === maxRetries;
-      logger.warn('embedder', `Embedding attempt ${attempt}/${maxRetries} failed`, {
+      logger.warn('embedder', `Batch embedding attempt ${attempt}/${maxRetries} failed`, {
         error: err.message,
-        textPreview: text.slice(0, 80),
+        batchSize: texts.length,
       });
       if (isLast) return null;
       await sleepWithJitter(baseDelay * Math.pow(2, attempt - 1));
@@ -97,36 +97,54 @@ async function embedSingleWithRetry(text) {
 }
 
 /**
- * Step 2: Embed each message's content individually for boundary detection.
- * Batches API calls with concurrency control. Failed messages get zero vectors.
+ * Step 2: Embed each message's content for boundary detection.
+ * Batches API calls using chunks of 100 to maximize throughput.
  *
  * @param {Array<{content: string}>} messages
- * @returns {Promise<Map<string, number[]>>} message index → normalized vector (zero vec on failure)
+ * @returns {Promise<Map<number, number[]>>} message index → normalized vector (zero vec on failure)
  */
 async function embedMessagesForDetection(messages) {
-  const concurrency = PIPELINE_CONFIG.DETECTION_EMBEDDING_CONCURRENCY;
-  const delayMs = PIPELINE_CONFIG.DETECTION_EMBEDDING_BATCH_DELAY_MS;
+  const batchSize = PIPELINE_CONFIG.EMBEDDING_BATCH_SIZE || 100;
+  const concurrency = PIPELINE_CONFIG.DETECTION_EMBEDDING_CONCURRENCY || 5;
+  const delayMs = PIPELINE_CONFIG.DETECTION_EMBEDDING_BATCH_DELAY_MS || 200;
+
   const results = new Map();
   let failCount = 0;
 
-  // Process in chunks of `concurrency`
-  for (let i = 0; i < messages.length; i += concurrency) {
-    const chunk = messages.slice(i, i + concurrency);
-    const promises = chunk.map((msg, idx) =>
-      embedSingleWithRetry(msg.content).then(vec => {
-        const globalIdx = i + idx;
-        if (vec === null) {
-          // Assign zero vector matching expected dimension (1024 for bge-large)
-          results.set(globalIdx, new Array(1024).fill(0));
-          failCount++;
-        } else {
-          results.set(globalIdx, vec);
+  // Split into API-sized batches (e.g. 100 messages each)
+  const apiBatches = [];
+  for (let i = 0; i < messages.length; i += batchSize) {
+    apiBatches.push(messages.slice(i, i + batchSize));
+  }
+
+  // Process batch groups concurrently
+  for (let i = 0; i < apiBatches.length; i += concurrency) {
+    const batchGroup = apiBatches.slice(i, i + concurrency);
+
+    // Each element in batchGroup is an array of messages
+    const promises = batchGroup.map(async (batch, groupIdx) => {
+      const globalOffset = (i + groupIdx) * batchSize;
+      const texts = batch.map(msg => msg.content);
+
+      const vectors = await embedBatchWithRetry(texts);
+
+      if (!vectors) {
+        // Entire batch failed — assign zero vectors
+        failCount += batch.length;
+        for (let j = 0; j < batch.length; j++) {
+          results.set(globalOffset + j, new Array(1024).fill(0));
         }
-      })
-    );
+      } else {
+        // Success — map vectors to global indices
+        for (let j = 0; j < batch.length; j++) {
+          results.set(globalOffset + j, vectors[j]);
+        }
+      }
+    });
+
     await Promise.all(promises);
 
-    if (i + concurrency < messages.length) {
+    if (i + concurrency < apiBatches.length) {
       await sleepWithJitter(delayMs);
     }
   }
@@ -135,6 +153,7 @@ async function embedMessagesForDetection(messages) {
     total: messages.length,
     failed: failCount,
     success: messages.length - failCount,
+    apiBatches: apiBatches.length
   });
 
   return results;
