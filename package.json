@@ -4,6 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
+    "pipeline": "node pipeline/src/index.js",
     "test": "jest --forceExit",
     "build": "echo 'no build'"
   },

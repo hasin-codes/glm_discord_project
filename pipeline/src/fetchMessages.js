@@ -101,4 +101,42 @@ async function fetchMessages(startTime, endTime) {
   return allMessages;
 }
 
-module.exports = { fetchMessages };
+/**
+ * Group messages by calendar date (UTC).
+ * Each date bucket contains messages from 00:00:00 to 23:59:59 UTC.
+ *
+ * @param {Array} messages - Array of message objects with `timestamp` field
+ * @returns {Map<string, Array>} Map of date string (YYYY-MM-DD) → messages for that date
+ */
+function groupMessagesByDate(messages) {
+  const dateGroups = new Map();
+
+  for (const msg of messages) {
+    // Extract date from timestamp (UTC)
+    const dateStr = msg.timestamp.split('T')[0]; // "2026-03-24" from "2026-03-24T14:27:12.632+00:00"
+
+    if (!dateGroups.has(dateStr)) {
+      dateGroups.set(dateStr, []);
+    }
+    dateGroups.get(dateStr).push(msg);
+  }
+
+  // Sort dates chronologically
+  const sortedDates = Array.from(dateGroups.keys()).sort();
+  const sortedMap = new Map();
+  for (const date of sortedDates) {
+    sortedMap.set(date, dateGroups.get(date));
+  }
+
+  logger.info('fetchMessages', `Grouped messages into ${sortedMap.size} date buckets`, {
+    dates: sortedDates,
+    messagesPerDate: sortedDates.map(d => ({
+      date: d,
+      count: dateGroups.get(d).length,
+    })),
+  });
+
+  return sortedMap;
+}
+
+module.exports = { fetchMessages, groupMessagesByDate };

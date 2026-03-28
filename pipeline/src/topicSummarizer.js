@@ -263,11 +263,22 @@ function calculateEngagementMetrics(segments) {
 /**
  * Generate summaries for all topic clusters.
  * Returns array of summary objects ready for database insertion.
+ *
+ * @param {Map<number, string>} classifications - segmentIndex → topicLabel
+ * @param {Array} segments - Array of segment objects with messages
+ * @param {string} batchId - Batch UUID for tracking
+ * @param {string} processingDate - Calendar date (YYYY-MM-DD) for date isolation
+ * @returns {Promise<Array>} Array of summary objects with processing_date field
  */
-async function generateTopicSummaries(classifications, segments, batchId) {
+async function generateTopicSummaries(classifications, segments, batchId, processingDate) {
+  // Validate processingDate
+  if (!processingDate) {
+    throw new Error('processingDate is required for date isolation. See pipeline/README.md for migration.');
+  }
+
   // Group segments by topic label
   const topicGroups = new Map();
-  
+
   classifications.forEach((topicLabel, segmentIndex) => {
     if (!topicGroups.has(topicLabel)) {
       topicGroups.set(topicLabel, []);
@@ -277,28 +288,29 @@ async function generateTopicSummaries(classifications, segments, batchId) {
       topicGroups.get(topicLabel).push(segment);
     }
   });
-  
+
   const summaries = [];
   let clusterId = 0;
-  
+
   for (const [topicLabel, topicSegments] of topicGroups) {
     logger.info('topicSummarizer', `Generating summary for topic: "${topicLabel}"`, {
       segmentCount: topicSegments.length,
+      processingDate,
     });
-    
+
     // Generate LLM summary
     const llmSummary = await summarizeTopic(topicLabel, topicSegments);
-    
+
     // Calculate engagement metrics
     const metrics = calculateEngagementMetrics(topicSegments);
-    
+
     // Calculate time range
-    const allTimestamps = topicSegments.flatMap(s => 
+    const allTimestamps = topicSegments.flatMap(s =>
       s.messages.map(m => new Date(m.timestamp).getTime())
     );
     const startTimestamp = new Date(Math.min(...allTimestamps)).toISOString();
     const endTimestamp = new Date(Math.max(...allTimestamps)).toISOString();
-    
+
     summaries.push({
       batch_id: batchId,
       cluster_id: clusterId++,
@@ -315,17 +327,19 @@ async function generateTopicSummaries(classifications, segments, batchId) {
       end_timestamp: endTimestamp,
       llm_model: CHAT_MODEL,
       llm_tokens_used: llmSummary.tokensUsed,
+      processing_date: processingDate, // DATE ISOLATION: Explicit date column
     });
-    
+
     // Small delay between summaries to avoid rate limits
     await new Promise(r => setTimeout(r, 200));
   }
-  
+
   logger.info('topicSummarizer', `Generated ${summaries.length} topic summaries`, {
     totalSegments: segments.length,
     totalTopics: summaries.length,
+    processingDate,
   });
-  
+
   return summaries;
 }
 

@@ -7,7 +7,7 @@ try { require('dotenv').config(); } catch { }
 const { PIPELINE_CONFIG } = require('../pipeline.config');
 const logger = require('./logger');
 const batchTracker = require('./batchTracker');
-const { fetchMessages } = require('./fetchMessages');
+const { fetchMessages, groupMessagesByDate } = require('./fetchMessages');
 const { detectBoundariesPipeline } = require('./boundaryDetection');
 const { classifyPipeline } = require('./classifier');
 const { storeSegmentClassifications } = require('./storeResults');
@@ -141,27 +141,58 @@ async function runPipeline() {
 
     logger.info('orchestrator', `Processing ${messages.length} messages`);
 
-    // Step 2: Boundary detection → segments
-    const segments = await detectBoundariesPipeline(messages);
+    // Step 2: Group messages by calendar date (UTC)
+    // Each date is processed independently for clean daily reporting
+    const dailyGroups = groupMessagesByDate(messages);
 
-    if (segments.length === 0) {
-      logger.info('orchestrator', 'No segments produced');
-      const nowISO = new Date().toISOString();
-      await batchTracker.setLastBatch(batchId, nowISO);
-      await batchTracker.setBatchStatus(batchId, 'done', startedAt, nowISO);
-      return;
+    // Step 3: Process each date independently
+    let totalSegments = 0;
+    let totalClusters = 0;
+    let totalMessageRows = 0;
+    let allSegments = []; // Collect all segments for Qdrant indexing
+
+    for (const [processingDate, dayMessages] of dailyGroups) {
+      logger.info('orchestrator', `Processing date: ${processingDate}`, {
+        messageCount: dayMessages.length,
+      });
+
+      // Run boundary detection for this date only
+      const segments = await detectBoundariesPipeline(dayMessages);
+
+      if (segments.length === 0) {
+        logger.warn('orchestrator', `No segments for ${processingDate}`);
+        continue;
+      }
+
+      allSegments = allSegments.concat(segments);
+
+      // LLM classification
+      const classifications = await classifyPipeline(segments);
+
+      // Store to Supabase with processing_date
+      const { clusterRows, messageRows } = await storeSegmentClassifications(
+        classifications,
+        segments,
+        batchId,
+        null, // Supabase client (uses default)
+        processingDate // NEW: Pass the processing date for date isolation
+      );
+
+      totalSegments += segments.length;
+      totalClusters += clusterRows;
+      totalMessageRows += messageRows;
+
+      logger.info('orchestrator', `Completed ${processingDate}`, {
+        segments: segments.length,
+        clusters: clusterRows,
+        messages: messageRows,
+      });
     }
 
-    // Step 3: LLM sub-topic classification (PRIMARY PATH)
-    const classifications = await classifyPipeline(segments);
-
-    // Step 4: Store classifications to Supabase
-    const { clusterRows, messageRows } = await storeSegmentClassifications(
-      classifications, segments, batchId
-    );
-
-    // Step 5: Best-effort embed + Qdrant indexing (non-blocking)
-    await bestEffortEmbedAndIndex(segments);
+    // Step 4: Best-effort embed + Qdrant indexing (non-blocking)
+    // Note: This runs on all segments together (not date-isolated)
+    // Qdrant is used for RAG retrieval, not daily reporting
+    await bestEffortEmbedAndIndex(allSegments);
 
     // Success — update tracking
     // Use the latest timestamp from the data we just processed
@@ -173,9 +204,10 @@ async function runPipeline() {
     logger.info('orchestrator', 'Pipeline complete', {
       durationMs,
       messageCount: messages.length,
-      segmentCount: segments.length,
-      topicClusters: clusterRows,
-      messageRows,
+      datesProcessed: dailyGroups.size,
+      totalSegments,
+      totalClusters,
+      totalMessageRows,
     });
 
   } catch (err) {

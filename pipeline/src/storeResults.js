@@ -150,14 +150,59 @@ async function storeClusterResults(clusterAssignments, qdrantPoints, batchId, cl
  * Groups segments by topic label and writes to pipeline_clusters + pipeline_cluster_messages.
  * Also generates LLM summaries for each topic.
  *
+ * CRITICAL: This function enforces date isolation. Before inserting clusters for a
+ * processing date, it DELETEs any existing clusters for that date. This makes the
+ * pipeline idempotent — re-running for a specific date will regenerate only that
+ * date's data without affecting other dates.
+ *
  * @param {Map<number, string>} classifications - segmentIndex → topicLabel
  * @param {Array<{segmentIndex: number, messages: Array, boundaryScore: number|null, startTimestamp: string, endTimestamp: string}>} segments
  * @param {string} batchId
  * @param {object} [client] - Optional Supabase client override (for testing)
+ * @param {string} processingDate - Calendar date (YYYY-MM-DD) for date isolation
  * @returns {Promise<{clusterRows: number, messageRows: number, summaryRows: number}>}
  */
-async function storeSegmentClassifications(classifications, segments, batchId, client) {
+async function storeSegmentClassifications(classifications, segments, batchId, client, processingDate) {
   const db = client || getSupabase();
+
+  // Validate processingDate
+  if (!processingDate) {
+    throw new Error('processingDate is required for date isolation. See pipeline/README.md for migration.');
+  }
+
+  // DATE ISOLATION: Delete existing clusters for this processing date
+  // This ensures idempotent re-processing — running the pipeline for a specific
+  // date will completely replace that date's data without duplicates
+  logger.info('storeResults', `Deleting existing clusters for ${processingDate} (date isolation)`);
+  
+  const { error: deleteClusterError } = await db
+    .from('pipeline_clusters')
+    .delete()
+    .eq('processing_date', processingDate);
+
+  if (deleteClusterError) {
+    throw new Error(`Failed to delete existing clusters for ${processingDate}: ${deleteClusterError.message}`);
+  }
+
+  const { error: deleteSummaryError } = await db
+    .from('pipeline_topic_summaries')
+    .delete()
+    .eq('processing_date', processingDate);
+
+  if (deleteSummaryError) {
+    throw new Error(`Failed to delete existing summaries for ${processingDate}: ${deleteSummaryError.message}`);
+  }
+
+  const { error: deleteMsgError } = await db
+    .from('pipeline_cluster_messages')
+    .delete()
+    .eq('processing_date', processingDate);
+
+  if (deleteMsgError) {
+    throw new Error(`Failed to delete existing cluster messages for ${processingDate}: ${deleteMsgError.message}`);
+  }
+
+  logger.info('storeResults', `Cleared existing data for ${processingDate}`);
 
   // Group segments by topic label
   const labelGroups = new Map();
@@ -213,6 +258,7 @@ async function storeSegmentClassifications(classifications, segments, batchId, c
       message_count: uniqueMessageIds.size,
       unique_users: uniqueUserIds.size,
       avg_boundary_score: avgBoundaryScore,
+      processing_date: processingDate, // DATE ISOLATION: Explicit date column
     });
 
     // Build message join rows
@@ -225,6 +271,7 @@ async function storeSegmentClassifications(classifications, segments, batchId, c
           context_block_id: seg.segmentIndex.toString(), // segment index as reference
           channel_id: msg.channel_id || null,
           user_id: msg.user_id || null,
+          processing_date: processingDate, // DATE ISOLATION: Explicit date column
         });
       }
     }
@@ -256,8 +303,13 @@ async function storeSegmentClassifications(classifications, segments, batchId, c
   }
 
   // Generate LLM summaries for each topic
-  logger.info('storeResults', 'Generating LLM topic summaries...');
-  const topicSummaries = await generateTopicSummaries(classifications, segments, batchId);
+  logger.info('storeResults', 'Generating LLM topic summaries...', { processingDate });
+  const topicSummaries = await generateTopicSummaries(
+    classifications,
+    segments,
+    batchId,
+    processingDate // Pass processingDate for date isolation
+  );
   
   // Write summaries to database
   if (topicSummaries.length > 0) {
