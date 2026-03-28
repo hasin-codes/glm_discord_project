@@ -5,7 +5,7 @@
 
 # Dependencies
 node_modules/
-package-lock.json
+# package-lock.json - NOW COMMITTED FOR RAILWAY
 
 # Environment
 .env
