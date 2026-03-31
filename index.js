@@ -130,10 +130,10 @@ client.once('clientReady', async () => {
   // Init message ingestion system (backfill + batch writer)
   await ingestion.init(client);
 
-  // ─── Reminder job (stays in bot — needs Discord client) ──────────
+  // ─── Reminder job — DISABLED
   // Runs every hour + once 30s after startup
-  setInterval(() => runReminderJob(client), 60 * 60 * 1000);
-  setTimeout(() => runReminderJob(client), 30 * 1000);
+  // setInterval(() => runReminderJob(client), 60 * 60 * 1000);
+  // setTimeout(() => runReminderJob(client), 30 * 1000);
 
   // ─── Cleaning: handled by Supabase Edge Function ───────────────────
   // See: supabase/functions/cleaning-cron/     (every 5 min via pg_cron)
